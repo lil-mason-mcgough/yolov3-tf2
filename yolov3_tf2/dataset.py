@@ -91,7 +91,7 @@ IMAGE_FEATURE_MAP = {
     'image/object/bbox/xmax': tf.io.VarLenFeature(tf.float32),
     'image/object/bbox/ymax': tf.io.VarLenFeature(tf.float32),
     'image/object/class/text': tf.io.VarLenFeature(tf.string),
-    # 'image/object/class/label': tf.io.VarLenFeature(tf.int64),
+    'image/object/class/label': tf.io.VarLenFeature(tf.int64),
     # 'image/object/difficult': tf.io.VarLenFeature(tf.int64),
     # 'image/object/truncated': tf.io.VarLenFeature(tf.int64),
     # 'image/object/view': tf.io.VarLenFeature(tf.string),

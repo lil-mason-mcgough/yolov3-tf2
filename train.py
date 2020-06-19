@@ -1,15 +1,21 @@
 from absl import app, flags, logging
 from absl.flags import FLAGS
+import os
 
 import tensorflow as tf
 import numpy as np
-import cv2
 from tensorflow.keras.callbacks import (
     ReduceLROnPlateau,
     EarlyStopping,
     ModelCheckpoint,
     TensorBoard
 )
+from tensorflow.keras.metrics import (
+    Precision,
+    Recall
+)
+from tensorflow.keras.layers import Lambda
+from tensorflow.keras.models import Model
 from yolov3_tf2.models import (
     YoloV3, YoloV3Tiny, YoloLoss,
     yolo_anchors, yolo_anchor_masks,
@@ -17,6 +23,7 @@ from yolov3_tf2.models import (
 )
 from yolov3_tf2.utils import freeze_all
 import yolov3_tf2.dataset as dataset
+from yolov3_tf2.models import post_process_block
 
 flags.DEFINE_string('dataset', '', 'path to dataset')
 flags.DEFINE_string('val_dataset', '', 'path to validation dataset')
@@ -42,7 +49,143 @@ flags.DEFINE_float('learning_rate', 1e-3, 'learning rate')
 flags.DEFINE_integer('num_classes', 80, 'number of classes in the model')
 flags.DEFINE_integer('weights_num_classes', None, 'specify num class for `weights` file if different, '
                      'useful in transfer learning with different number of classes')
+flags.DEFINE_string('checkpoint_dir', './checkpoints/training', 'path to save checkpoints')
 
+def log_batch(logging, epoch, batch, total_loss, pred_loss):
+    # TODO: calculate precision, recall, and mAP
+    loss_total = "ep:{}, batch:{}, loss_total:{:.4f}".format(
+        epoch, batch, total_loss.numpy())
+    loss_by_output = ''.join([', out_{}:{:.4f}'.format(
+        i, np.sum(tf.reduce_sum(x).numpy())) 
+        for i, x in enumerate(pred_loss)])
+    logging.info(loss_total + loss_by_output)
+
+def true_false_positives(boxes, scores, y_true, iou_thres=0.5, score_thres=0.5):
+    """
+    Compute number of true and false positives with same class.
+
+    Inputs:
+        boxes - Predicted boxes in (xmin, ymin, xmax, ymax) format.
+        scores - Corresponding scores for each predicted box.
+        y_true - Label boxes in (xmin, ymin, xmax, ymax) format.
+        iou_thres - Minimum IOU for positive detection.
+        score_thres - Minimum prediction score for positive detection.
+    Returns:
+        true_pos - Number of correct positive predictions.
+        false_pos - Number of incorrect positive predictions.
+    """
+
+    n_pos = y_true.shape[0]
+    # no true positives
+    if n_pos == 0:
+        return 0., float(boxes.shape[0])
+
+    sorted_ind = np.argsort(-scores)
+    try:
+        boxes = boxes[sorted_ind, :]
+    except:
+        return 0., 0.
+    
+    true_found_yet = np.zeros(y_true.shape[0])
+    true_pos = 0.
+    false_pos = 0.
+    for box, score in zip(boxes, scores):
+        if score < score_thres:
+            continue
+        ovmax = -np.Inf
+        ixmin = np.maximum(y_true[:, 0], box[0])
+        iymin = np.maximum(y_true[:, 1], box[1])
+        ixmax = np.minimum(y_true[:, 2], box[2])
+        iymax = np.minimum(y_true[:, 3], box[3])
+        iw = np.maximum(ixmax - ixmin + 1., 0.)
+        ih = np.maximum(iymax - iymin + 1., 0.)
+        inters = iw * ih
+
+        # union
+        uni = ((box[2] - box[0] + 1.) * (box[3] - box[1] + 1.) + (y_true[:, 2] - y_true[:, 0] + 1.) * (
+                    y_true[:, 3] - y_true[:, 1] + 1.) - inters)
+
+        overlaps = inters / uni
+        ovmax = np.max(overlaps)
+        max_gt_idx = np.argmax(overlaps)
+
+        if ovmax > iou_thres:
+            # gt not matched yet
+            if not true_found_yet[max_gt_idx]:
+                true_pos += 1.
+                true_found_yet[max_gt_idx] = 1
+            else:
+                false_pos += 1.
+        else:
+            false_pos += 1.
+    return true_pos, false_pos
+
+def calc_precision(true_pos, false_pos):
+    return true_pos / np.maximum(true_pos + false_pos,
+        np.finfo(np.float64).eps)
+
+def calc_recall(true_pos, n_pos):
+    return true_pos / float(n_pos)
+
+def batch_true_false_positives(preds, labels, num_classes):
+    """
+    Compute true positives, false positives, and number of positives across a
+        batch of predictions.
+
+    Inputs:
+        preds - Tensor containing predictions in format: 
+            (boxes, scores, classes, n_valid_detections).
+        labels - Tensor of labels in format: (xmin, ymin, xmax, ymax, class).
+        num_classes - The total number of classes in dataset.
+    Returns:
+        true_pos - List with number of correct positive predictions for each observation.
+        false_pos - List with number of incorrect positive predictions for each observation.
+        n_pos - List with number of ground truth positives for each observation.
+    """
+
+    true_pos = np.zeros(num_classes)
+    false_pos = np.zeros(num_classes)
+    n_pos = np.zeros(num_classes)
+    for boxes, scores, classes, valid_dets, img_labels in zip(*preds, labels):
+        boxes = boxes[:valid_dets]
+        scores = scores[:valid_dets]
+        classes = classes[:valid_dets]
+        img_labels = img_labels
+        
+        # remove zero padding
+        img_labels_size = np.multiply.reduce(
+            img_labels[..., 2:4] - img_labels[..., 0:2], axis=-1)
+        img_labels = img_labels[img_labels_size > 1e-8]
+        for c in range(num_classes):
+            c_img_labels = img_labels[img_labels[..., -1] == c]
+            c_idxs = np.nonzero(classes == c)
+            n_pos[c] += len(c_idxs)
+            tp, fp = true_false_positives(boxes[c_idxs], scores[c_idxs], c_img_labels)
+            true_pos[c] += tp
+            false_pos[c] += fp
+
+    return true_pos, false_pos, n_pos
+
+def batch_precision_recall(true_pos, false_pos, n_pos):
+    """
+    Compute precision and recall across a batch of observations.
+
+    Inputs:
+        true_pos - List with number of correct positive predictions for each observation.
+        false_pos - List with number of incorrect positive predictions for each observation.
+        n_pos - List with number of ground truth positives for each observation.
+    Returns:
+        precision - The precision for each observation.
+        recall - The recall for each observation.
+    """
+
+    precision = np.zeros(true_pos.shape)
+    recall = np.zeros(true_pos.shape)
+    for c in range(true_pos.shape[0]):
+        precision[c] = calc_precision(true_pos[c], false_pos[c])
+        recall[c] = calc_recall(true_pos[c], n_pos[c])
+    return precision, recall
+    
 
 def main(_argv):
     physical_devices = tf.config.experimental.list_physical_devices('GPU')
@@ -59,6 +202,10 @@ def main(_argv):
         anchors = yolo_anchors
         anchor_masks = yolo_anchor_masks
 
+    post_process_outputs = post_process_block(model.outputs, 
+        classes=FLAGS.num_classes)
+    post_process_model = Model(model.inputs, post_process_outputs)
+
     train_dataset = dataset.load_fake_dataset()
     if FLAGS.dataset:
         train_dataset = dataset.load_tfrecord_dataset(
@@ -67,7 +214,8 @@ def main(_argv):
     train_dataset = train_dataset.batch(FLAGS.batch_size)
     train_dataset = train_dataset.map(lambda x, y: (
         dataset.transform_images(x, FLAGS.size),
-        dataset.transform_targets(y, anchors, anchor_masks, FLAGS.size)))
+        y))
+        # dataset.transform_targets(y, anchors, anchor_masks, FLAGS.size)))
     train_dataset = train_dataset.prefetch(
         buffer_size=tf.data.experimental.AUTOTUNE)
 
@@ -78,7 +226,8 @@ def main(_argv):
     val_dataset = val_dataset.batch(FLAGS.batch_size)
     val_dataset = val_dataset.map(lambda x, y: (
         dataset.transform_images(x, FLAGS.size),
-        dataset.transform_targets(y, anchors, anchor_masks, FLAGS.size)))
+        y))
+        # dataset.transform_targets(y, anchors, anchor_masks, FLAGS.size)))
 
     # Configure the model for transfer learning
     if FLAGS.transfer == 'none':
@@ -107,7 +256,6 @@ def main(_argv):
                     l.set_weights(model_pretrained.get_layer(
                         l.name).get_weights())
                     freeze_all(l)
-
     else:
         # All other transfer require matching classes
         model.load_weights(FLAGS.weights)
@@ -123,6 +271,9 @@ def main(_argv):
     loss = [YoloLoss(anchors[mask], classes=FLAGS.num_classes)
             for mask in anchor_masks]
 
+    # (batch_size, grid, grid, anchors, (x, y, w, h, obj, ...cls))
+    # model.outputs shape: [[N, 13, 13, 3, 85], [N, 26, 26, 3, 85], [N, 52, 52, 3, 85]]
+    # labels shape: ([N, 13, 13, 3, 6], [N, 26, 26, 3, 6], [N, 52, 52, 3, 6])
     if FLAGS.mode == 'eager_tf':
         # Eager mode is great for debugging
         # Non eager graph mode is recommended for real training
@@ -135,41 +286,71 @@ def main(_argv):
                     outputs = model(images, training=True)
                     regularization_loss = tf.reduce_sum(model.losses)
                     pred_loss = []
-                    for output, label, loss_fn in zip(outputs, labels, loss):
+                    transf_labels = dataset.transform_targets(labels, anchors, anchor_masks, FLAGS.size)
+                    for output, label, loss_fn in zip(outputs, transf_labels, loss):
                         pred_loss.append(loss_fn(label, output))
-                    total_loss = tf.reduce_sum(pred_loss) + regularization_loss
+                    total_loss = tf.reduce_sum(pred_loss, axis=None) + regularization_loss
 
                 grads = tape.gradient(total_loss, model.trainable_variables)
                 optimizer.apply_gradients(
                     zip(grads, model.trainable_variables))
 
-                logging.info("{}_train_{}, {}, {}".format(
-                    epoch, batch, total_loss.numpy(),
-                    list(map(lambda x: np.sum(x.numpy()), pred_loss))))
+                log_batch(logging, epoch, batch, total_loss, pred_loss)
                 avg_loss.update_state(total_loss)
 
+                if batch >= 100:
+                    break
+
+            true_pos_total = np.zeros(FLAGS.num_classes)
+            false_pos_total = np.zeros(FLAGS.num_classes)
+            n_pos_total = np.zeros(FLAGS.num_classes)
             for batch, (images, labels) in enumerate(val_dataset):
+                # get losses
                 outputs = model(images)
                 regularization_loss = tf.reduce_sum(model.losses)
                 pred_loss = []
-                for output, label, loss_fn in zip(outputs, labels, loss):
+                transf_labels = dataset.transform_targets(labels, anchors, anchor_masks, FLAGS.size)
+                for output, label, loss_fn in zip(outputs, transf_labels, loss):
                     pred_loss.append(loss_fn(label, output))
                 total_loss = tf.reduce_sum(pred_loss) + regularization_loss
-
-                logging.info("{}_val_{}, {}, {}".format(
-                    epoch, batch, total_loss.numpy(),
-                    list(map(lambda x: np.sum(x.numpy()), pred_loss))))
+                log_batch(logging, epoch, batch, total_loss, pred_loss)
                 avg_val_loss.update_state(total_loss)
 
+                # get true positives, false positives, and positive labels
+                preds = post_process_model(images)
+                true_pos, false_pos, n_pos = batch_true_false_positives(preds.numpy(), 
+                    labels.numpy(), FLAGS.num_classes)
+                true_pos_total += true_pos
+                false_pos_total += false_pos
+                n_pos_total += n_pos
+
+                if batch >= 20:
+                    break
+
+            # precision-recall by class
+            precision, recall = batch_precision_recall(true_pos_total, 
+                false_pos_total, n_pos_total)
+            for c in range(FLAGS.num_classes):
+                print('Class {} - Prec: {}, Rec: {}'.format(c, 
+                    precision[c], recall[c]))
+            # total precision-recall
+            print('Total - Prec: {}, Rec: {}'.format(
+                calc_precision(np.sum(true_pos_total), np.sum(false_pos_total)), 
+                calc_recall(np.sum(true_pos_total), np.sum(n_pos_total))))
+            import pdb; pdb.set_trace()
+
+            # log losses
             logging.info("{}, train: {}, val: {}".format(
                 epoch,
                 avg_loss.result().numpy(),
                 avg_val_loss.result().numpy()))
 
+            # reset loop and save weights
             avg_loss.reset_states()
             avg_val_loss.reset_states()
             model.save_weights(
-                'checkpoints/yolov3_train_{}.tf'.format(epoch))
+                os.path.join(FLAGS.checkpoint_dir, 'yolov3_train_{}.tf'\
+                    .format(epoch)))
     else:
         model.compile(optimizer=optimizer, loss=loss,
                       run_eagerly=(FLAGS.mode == 'eager_fit'))
@@ -177,9 +358,10 @@ def main(_argv):
         callbacks = [
             ReduceLROnPlateau(verbose=1),
             EarlyStopping(patience=3, verbose=1),
-            ModelCheckpoint('checkpoints/yolov3_train_{epoch}.tf',
-                            verbose=1, save_weights_only=True),
-            TensorBoard(log_dir='logs')
+            ModelCheckpoint(
+                os.path.join(FLAGS.checkpoint_dir, 'yolov3_train_{epoch}.tf'),
+                verbose=1, save_weights_only=True),
+            TensorBoard(log_dir=FLAGS.log_dir)
         ]
 
         history = model.fit(train_dataset,
