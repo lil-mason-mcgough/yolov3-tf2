@@ -1,6 +1,7 @@
 import time
 import os
 import hashlib
+import glob
 
 from absl import app, flags, logging
 from absl.flags import FLAGS
@@ -11,8 +12,8 @@ import tqdm
 flags.DEFINE_string('data_dir', './data/voc2012_raw/VOCdevkit/VOC2012/',
                     'path to raw PASCAL VOC dataset')
 flags.DEFINE_enum('split', 'train', [
-                  'train', 'val'], 'specify train or val spit')
-flags.DEFINE_string('output_file', './data/voc2012_train.tfrecord', 'outpot dataset')
+                  'train', 'val'], 'specify train or val split')
+flags.DEFINE_string('output_file', './data/voc2012_train.tfrecord', 'output dataset')
 flags.DEFINE_string('classes', './data/voc2012.names', 'classes file')
 
 
@@ -92,17 +93,20 @@ def main(_argv):
     logging.info("Class mapping loaded: %s", class_map)
 
     writer = tf.io.TFRecordWriter(FLAGS.output_file)
-    image_list = open(os.path.join(
-        FLAGS.data_dir, 'ImageSets', 'Main', 'aeroplane_%s.txt' % FLAGS.split)).read().splitlines()
-    logging.info("Image list loaded: %d", len(image_list))
-    for image in tqdm.tqdm(image_list):
-        name, _ = image.split()
-        annotation_xml = os.path.join(
-            FLAGS.data_dir, 'Annotations', name + '.xml')
-        annotation_xml = lxml.etree.fromstring(open(annotation_xml).read())
-        annotation = parse_xml(annotation_xml)['annotation']
-        tf_example = build_example(annotation, class_map)
-        writer.write(tf_example.SerializeToString())
+    image_list_files = glob.glob(os.path.join(
+        FLAGS.data_dir, 'ImageSets', 'Main', '*_%s.txt' % FLAGS.split))
+    logging.info('%s image lists found: %s' % (len(image_list_files), image_list_files))
+    for image_list_file in image_list_files:
+        image_list = open(image_list_file).read().splitlines()
+        logging.info("Image list loaded: %d", len(image_list))
+        for image in tqdm.tqdm(image_list):
+            name, _ = image.split()
+            annotation_xml = os.path.join(
+                FLAGS.data_dir, 'Annotations', name + '.xml')
+            annotation_xml = lxml.etree.fromstring(open(annotation_xml).read())
+            annotation = parse_xml(annotation_xml)['annotation']
+            tf_example = build_example(annotation, class_map)
+            writer.write(tf_example.SerializeToString())
     writer.close()
     logging.info("Done")
 
